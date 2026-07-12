@@ -4,16 +4,17 @@ on:
   workflow_dispatch:
     inputs:
       url:
-        description: "URL to open in iOS Safari (include query params as needed)"
+        description: "URL to open in iOS Safari"
         required: true
+        default: "https://togetherland.vercel.app"
       device:
         description: "Simulator device name"
         required: false
         default: "iPhone 17"
       swipes:
-        description: "Number of scroll swipes to perform"
+        description: "Number of scroll swipes"
         required: false
-        default: "6"
+        default: "8"
 
 jobs:
   diagnose:
@@ -34,40 +35,25 @@ jobs:
                 | select(.key | contains("SimRuntime.iOS")) | .value[]
                 | select(.name == $NAME) | .udid' \
             | head -n1)
-          if [ -z "$UDID" ]; then
-            echo "No available device named '$DEVICE_NAME'."
-            xcrun simctl list devices available
-            exit 1
-          fi
+          [ -n "$UDID" ] || { echo "No device '$DEVICE_NAME'"; xcrun simctl list devices available; exit 1; }
           BOOTED=0
-          for attempt in 1 2 3; do
+          for a in 1 2 3; do
             if xcrun simctl bootstatus "$UDID" -b; then BOOTED=1; break; fi
-            xcrun simctl shutdown "$UDID" >/dev/null 2>&1 || true
-            sleep 5
+            xcrun simctl shutdown "$UDID" >/dev/null 2>&1 || true; sleep 5
           done
-          [ "$BOOTED" = "1" ] || { echo "Simulator failed to boot"; exit 1; }
+          [ "$BOOTED" = "1" ] || { echo "boot failed"; exit 1; }
           echo "udid=$UDID" >> "$GITHUB_OUTPUT"
+          # Logical point size of the screen (for coordinate math).
+          xcrun simctl io "$UDID" enumerate 2>/dev/null | grep -iE "point|pixel|Main" | head -8 || true
 
-      - name: Install AXe (touch injection)
+      - name: Install AXe and print command surface
         run: |
           set -euo pipefail
-          export HOMEBREW_NO_AUTO_UPDATE=1
-          if brew install cameroncooke/axe/axe; then
-            echo "AXe via brew"
-          else
-            echo "brew failed; trying GitHub release"
-            ASSET_URL=$(curl -s https://api.github.com/repos/cameroncooke/AXe/releases/latest \
-              | jq -r '.assets[] | select(.name | test("(?i)(arm64|macos|darwin)")) | .browser_download_url' \
-              | head -n1)
-            curl -sL "$ASSET_URL" -o /tmp/axe-release
-            file /tmp/axe-release
-            case "$ASSET_URL" in
-              *.tar.gz) tar -xzf /tmp/axe-release -C /tmp && sudo cp "$(find /tmp -name axe -type f -perm +111 | head -n1)" /usr/local/bin/axe ;;
-              *.zip) unzip -o /tmp/axe-release -d /tmp/axe-dir && sudo cp "$(find /tmp/axe-dir -name axe -type f | head -n1)" /usr/local/bin/axe && sudo chmod +x /usr/local/bin/axe ;;
-              *) sudo cp /tmp/axe-release /usr/local/bin/axe && sudo chmod +x /usr/local/bin/axe ;;
-            esac
-          fi
-          axe --version || axe --help | head -3
+          export HOMEBREW_NO_AUTO_UPDATE=1 HOMEBREW_NO_REQUIRE_TAP_TRUST=1
+          brew install cameroncooke/axe/axe
+          echo "=== axe --help ==="; axe --help || true
+          echo "=== axe swipe --help ==="; axe swipe --help || true
+          echo "=== axe tap --help ==="; axe tap --help || true
 
       - name: Clean status bar
         continue-on-error: true
@@ -75,44 +61,48 @@ jobs:
           xcrun simctl status_bar "${{ steps.boot.outputs.udid }}" override \
             --time "9:41" --batteryLevel 100 --batteryState charged --cellularBars 4
 
-      - name: Warm the dev server through the tunnel
-        run: |
-          for i in 1 2 3; do
-            CODE=$(curl -s -o /dev/null -w "%{http_code}" -m 60 "$TARGET_URL") && echo "warm $i: $CODE"
-            [ "$CODE" = "200" ] && break
-            sleep 5
-          done
-
-      - name: Open URL in Safari
+      - name: Open URL and settle
         run: |
           xcrun simctl openurl "${{ steps.boot.outputs.udid }}" "$TARGET_URL"
-          sleep 20
+          sleep 22
 
-      - name: Baseline screenshots and coach-mark dismiss
+      - name: Accessibility dump + coach-mark dismiss
+        continue-on-error: true
         run: |
           UDID="${{ steps.boot.outputs.udid }}"
           mkdir -p shots
-          xcrun simctl io "$UDID" screenshot shots/00-baseline.png
-          # Safari first-run coach mark: tap its close button (points).
-          axe tap -x 364 -y 619 --udid "$UDID" || echo "tap failed (mark may be absent)"
+          xcrun simctl io "$UDID" screenshot shots/00-loaded.png
+          echo "=== describe-ui (top of tree) ==="
+          axe describe-ui --udid "$UDID" 2>&1 | head -120 || echo "describe-ui failed"
+          # Try to dismiss Safari's first-run coach mark by tapping its X.
+          # Screen is 402x874 pt on iPhone 17; the X sits near (363, 619).
+          axe tap -x 363 -y 619 --udid "$UDID" 2>&1 || echo "X-tap failed"
           sleep 2
-          xcrun simctl io "$UDID" screenshot shots/01-dismissed.png
+          xcrun simctl io "$UDID" screenshot shots/01-after-dismiss.png
 
-      - name: Swipe and capture
+      - name: Swipe to scroll, capture each step
         run: |
           set -u
           UDID="${{ steps.boot.outputs.udid }}"
+          # Swipe in the clear upper band, above the toolbar/coach-mark zone
+          # (~467-633 pt). Start 430 -> end 110, x=201. Repeat to advance.
           for i in $(seq 1 "$SWIPES"); do
-            axe swipe --start-x 200 --start-y 700 --end-x 200 --end-y 200 --udid "$UDID" \
+            axe swipe --start-x 201 --start-y 430 --end-x 201 --end-y 110 --duration 0.25 --udid "$UDID" 2>&1 \
+              || axe swipe --start-x 201 --start-y 430 --end-x 201 --end-y 110 --udid "$UDID" 2>&1 \
               || echo "swipe $i failed"
             sleep 2
             xcrun simctl io "$UDID" screenshot "shots/$(printf '%02d' $((i+1)))-swipe-$i.png"
           done
-          sleep 4
-          xcrun simctl io "$UDID" screenshot shots/99-settled.png
+          sleep 3
+          xcrun simctl io "$UDID" screenshot shots/98-settled.png
+          # A native scroll sanity check: JS-free proof the page CAN scroll —
+          # tap-and-hold drag via a long swipe from very top.
+          axe swipe --start-x 201 --start-y 300 --end-x 201 --end-y 760 --duration 0.4 --udid "$UDID" 2>&1 || true
+          sleep 2
+          xcrun simctl io "$UDID" screenshot shots/99-scrolled-back.png
           ls -la shots/
 
-      - name: Upload screenshots
+      - name: Upload
         uses: actions/upload-artifact@v4
         with:
           name: diagnose-shots
