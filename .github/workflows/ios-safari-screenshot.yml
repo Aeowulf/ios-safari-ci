@@ -1,0 +1,91 @@
+name: ios-safari-screenshot
+
+on:
+  workflow_dispatch:
+    inputs:
+      url:
+        description: "URL to open in iOS Safari"
+        required: true
+        default: "https://example.com"
+      device:
+        description: "Simulator device name"
+        required: false
+        default: "iPhone 17"
+      settle_seconds:
+        description: "Seconds to wait after opening the URL before the first screenshot"
+        required: false
+        default: "15"
+
+jobs:
+  screenshot:
+    runs-on: macos-26
+    timeout-minutes: 20
+    env:
+      TARGET_URL: ${{ github.event.inputs.url }}
+      DEVICE_NAME: ${{ github.event.inputs.device }}
+      SETTLE_SECONDS: ${{ github.event.inputs.settle_seconds }}
+    steps:
+      - name: Environment info
+        run: |
+          sw_vers
+          xcodebuild -version
+          xcrun simctl list runtimes
+
+      - name: Boot simulator
+        id: boot
+        run: |
+          set -euo pipefail
+          UDID=$(xcrun simctl list devices available --json \
+            | jq -r --arg NAME "$DEVICE_NAME" '
+                .devices | to_entries | sort_by(.key) | reverse | .[]
+                | select(.key | contains("SimRuntime.iOS")) | .value[]
+                | select(.name == $NAME) | .udid' \
+            | head -n1)
+          if [ -z "$UDID" ]; then
+            echo "No available device named '$DEVICE_NAME'. Available devices:"
+            xcrun simctl list devices available
+            exit 1
+          fi
+          echo "Booting $DEVICE_NAME ($UDID)"
+          BOOTED=0
+          for attempt in 1 2 3; do
+            if xcrun simctl bootstatus "$UDID" -b; then
+              echo "Booted (attempt $attempt)"
+              BOOTED=1
+              break
+            fi
+            echo "Boot attempt $attempt failed; recycling the device"
+            xcrun simctl shutdown "$UDID" >/dev/null 2>&1 || true
+            sleep 5
+          done
+          if [ "$BOOTED" != "1" ]; then
+            echo "Simulator failed to boot after 3 attempts"
+            exit 1
+          fi
+          echo "udid=$UDID" >> "$GITHUB_OUTPUT"
+
+      - name: Clean status bar
+        continue-on-error: true
+        run: |
+          xcrun simctl status_bar "${{ steps.boot.outputs.udid }}" override \
+            --time "9:41" --batteryLevel 100 --batteryState charged --cellularBars 4
+
+      - name: Open URL in Safari
+        run: |
+          xcrun simctl openurl "${{ steps.boot.outputs.udid }}" "$TARGET_URL"
+
+      - name: Screenshots
+        run: |
+          sleep "$SETTLE_SECONDS"
+          mkdir -p shots
+          xcrun simctl io "${{ steps.boot.outputs.udid }}" screenshot shots/01-loaded.png
+          sleep 5
+          xcrun simctl io "${{ steps.boot.outputs.udid }}" screenshot shots/02-settled.png
+          ls -la shots/
+
+      - name: Upload screenshots
+        uses: actions/upload-artifact@v4
+        with:
+          name: screenshots
+          path: shots/
+          if-no-files-found: error
