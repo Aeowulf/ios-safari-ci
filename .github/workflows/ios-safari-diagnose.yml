@@ -35,7 +35,18 @@ jobs:
                 | select(.key | contains("SimRuntime.iOS")) | .value[]
                 | select(.name == $NAME) | .udid' \
             | head -n1)
+          if [ -z "$UDID" ]; then
+            echo "Device '$DEVICE_NAME' not pre-created; creating it."
+            DT=$(xcrun simctl list devicetypes --json \
+              | jq -r --arg NAME "$DEVICE_NAME" '.devicetypes[] | select(.name==$NAME) | .identifier' | head -n1)
+            RT=$(xcrun simctl list runtimes --json \
+              | jq -r '.runtimes[] | select(.isAvailable) | select(.identifier|contains("iOS")) | .identifier' | sort -V | tail -n1)
+            echo "devicetype=$DT runtime=$RT"
+            [ -n "$DT" ] && [ -n "$RT" ] || { echo "No devicetype/runtime match"; xcrun simctl list devicetypes | grep -i "$DEVICE_NAME"; xcrun simctl list runtimes; exit 1; }
+            UDID=$(xcrun simctl create "$DEVICE_NAME" "$DT" "$RT")
+          fi
           [ -n "$UDID" ] || { echo "No device '$DEVICE_NAME'"; xcrun simctl list devices available; exit 1; }
+          echo "Using $DEVICE_NAME → $UDID"
           BOOTED=0
           for a in 1 2 3; do
             if xcrun simctl bootstatus "$UDID" -b; then BOOTED=1; break; fi
