@@ -61,9 +61,22 @@ jobs:
           xcrun simctl status_bar "${{ steps.boot.outputs.udid }}" override \
             --time "9:41" --batteryLevel 100 --batteryState charged --cellularBars 4
 
+      - name: Warm the URL from the runner
+        run: |
+          for i in 1 2 3 4 5 6; do
+            CODE=$(curl -s -o /dev/null -w "%{http_code}" -m 40 "$TARGET_URL" || echo 000)
+            echo "warm $i: $CODE"
+            [ "$CODE" = "200" ] && break
+            sleep 4
+          done
+
       - name: Open URL and settle
         run: |
-          xcrun simctl openurl "${{ steps.boot.outputs.udid }}" "$TARGET_URL"
+          UDID="${{ steps.boot.outputs.udid }}"
+          for i in 1 2 3 4; do
+            if xcrun simctl openurl "$UDID" "$TARGET_URL"; then echo "openurl ok (attempt $i)"; break; fi
+            echo "openurl attempt $i failed; retrying"; sleep 5
+          done
           sleep 22
 
       - name: Accessibility dump + coach-mark dismiss
