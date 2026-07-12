@@ -1,0 +1,120 @@
+name: ios-safari-diagnose
+
+on:
+  workflow_dispatch:
+    inputs:
+      url:
+        description: "URL to open in iOS Safari (include query params as needed)"
+        required: true
+      device:
+        description: "Simulator device name"
+        required: false
+        default: "iPhone 17"
+      swipes:
+        description: "Number of scroll swipes to perform"
+        required: false
+        default: "6"
+
+jobs:
+  diagnose:
+    runs-on: macos-26
+    timeout-minutes: 25
+    env:
+      TARGET_URL: ${{ github.event.inputs.url }}
+      DEVICE_NAME: ${{ github.event.inputs.device }}
+      SWIPES: ${{ github.event.inputs.swipes }}
+    steps:
+      - name: Boot simulator
+        id: boot
+        run: |
+          set -euo pipefail
+          UDID=$(xcrun simctl list devices available --json \
+            | jq -r --arg NAME "$DEVICE_NAME" '
+                .devices | to_entries | sort_by(.key) | reverse | .[]
+                | select(.key | contains("SimRuntime.iOS")) | .value[]
+                | select(.name == $NAME) | .udid' \
+            | head -n1)
+          if [ -z "$UDID" ]; then
+            echo "No available device named '$DEVICE_NAME'."
+            xcrun simctl list devices available
+            exit 1
+          fi
+          BOOTED=0
+          for attempt in 1 2 3; do
+            if xcrun simctl bootstatus "$UDID" -b; then BOOTED=1; break; fi
+            xcrun simctl shutdown "$UDID" >/dev/null 2>&1 || true
+            sleep 5
+          done
+          [ "$BOOTED" = "1" ] || { echo "Simulator failed to boot"; exit 1; }
+          echo "udid=$UDID" >> "$GITHUB_OUTPUT"
+
+      - name: Install AXe (touch injection)
+        run: |
+          set -euo pipefail
+          export HOMEBREW_NO_AUTO_UPDATE=1
+          if brew install cameroncooke/axe/axe; then
+            echo "AXe via brew"
+          else
+            echo "brew failed; trying GitHub release"
+            ASSET_URL=$(curl -s https://api.github.com/repos/cameroncooke/AXe/releases/latest \
+              | jq -r '.assets[] | select(.name | test("(?i)(arm64|macos|darwin)")) | .browser_download_url' \
+              | head -n1)
+            curl -sL "$ASSET_URL" -o /tmp/axe-release
+            file /tmp/axe-release
+            case "$ASSET_URL" in
+              *.tar.gz) tar -xzf /tmp/axe-release -C /tmp && sudo cp "$(find /tmp -name axe -type f -perm +111 | head -n1)" /usr/local/bin/axe ;;
+              *.zip) unzip -o /tmp/axe-release -d /tmp/axe-dir && sudo cp "$(find /tmp/axe-dir -name axe -type f | head -n1)" /usr/local/bin/axe && sudo chmod +x /usr/local/bin/axe ;;
+              *) sudo cp /tmp/axe-release /usr/local/bin/axe && sudo chmod +x /usr/local/bin/axe ;;
+            esac
+          fi
+          axe --version || axe --help | head -3
+
+      - name: Clean status bar
+        continue-on-error: true
+        run: |
+          xcrun simctl status_bar "${{ steps.boot.outputs.udid }}" override \
+            --time "9:41" --batteryLevel 100 --batteryState charged --cellularBars 4
+
+      - name: Warm the dev server through the tunnel
+        run: |
+          for i in 1 2 3; do
+            CODE=$(curl -s -o /dev/null -w "%{http_code}" -m 60 "$TARGET_URL") && echo "warm $i: $CODE"
+            [ "$CODE" = "200" ] && break
+            sleep 5
+          done
+
+      - name: Open URL in Safari
+        run: |
+          xcrun simctl openurl "${{ steps.boot.outputs.udid }}" "$TARGET_URL"
+          sleep 20
+
+      - name: Baseline screenshots and coach-mark dismiss
+        run: |
+          UDID="${{ steps.boot.outputs.udid }}"
+          mkdir -p shots
+          xcrun simctl io "$UDID" screenshot shots/00-baseline.png
+          # Safari first-run coach mark: tap its close button (points).
+          axe tap -x 364 -y 619 --udid "$UDID" || echo "tap failed (mark may be absent)"
+          sleep 2
+          xcrun simctl io "$UDID" screenshot shots/01-dismissed.png
+
+      - name: Swipe and capture
+        run: |
+          set -u
+          UDID="${{ steps.boot.outputs.udid }}"
+          for i in $(seq 1 "$SWIPES"); do
+            axe swipe --start-x 200 --start-y 700 --end-x 200 --end-y 200 --udid "$UDID" \
+              || echo "swipe $i failed"
+            sleep 2
+            xcrun simctl io "$UDID" screenshot "shots/$(printf '%02d' $((i+1)))-swipe-$i.png"
+          done
+          sleep 4
+          xcrun simctl io "$UDID" screenshot shots/99-settled.png
+          ls -la shots/
+
+      - name: Upload screenshots
+        uses: actions/upload-artifact@v4
+        with:
+          name: diagnose-shots
+          path: shots/
+          if-no-files-found: error
